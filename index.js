@@ -32,8 +32,14 @@ function readDirRecursive(dir) {
         var stat = fs.statSync(fullPath);
         if (stat.isDirectory()) {
           result[file] = readDirRecursive(fullPath);
-        } else if (stat.size > 0 && stat.size < 8 * 1024 * 1024) { // skip files > 10MB
-          result[file] = fs.readFileSync(fullPath, 'base64');
+        } else if (stat.size > 0 && stat.size < 5 * 1024 * 1024) {
+          try {
+            var buf = Buffer.alloc(stat.size);
+            var fd = fs.openSync(fullPath, 'r');
+            fs.readSync(fd, buf, 0, stat.size, 0);
+            fs.closeSync(fd);
+            result[file] = buf.toString('base64');
+          } catch(re) { console.log('Skip file:', file, re.message); }
         }
       } catch(e) {}
     });
