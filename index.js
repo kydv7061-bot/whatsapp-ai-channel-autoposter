@@ -22,6 +22,22 @@ const SessionSchema = new mongoose.Schema({
 });
 const Session = mongoose.model('Session', SessionSchema);
 
+function safeReadFile(fullPath) {
+  try {
+    var stat = fs.statSync(fullPath);
+    if (stat.size <= 0 || stat.size > 5 * 1024 * 1024) return null;
+    // Read in chunks to avoid buffer overflow
+    var fd = fs.openSync(fullPath, 'r');
+    var buf = Buffer.allocUnsafe(stat.size);
+    var bytesRead = fs.readSync(fd, buf, 0, stat.size, 0);
+    fs.closeSync(fd);
+    if (bytesRead !== stat.size) return null;
+    return buf.toString('base64');
+  } catch(e) {
+    return null;
+  }
+}
+
 function readDirRecursive(dir) {
   var result = {};
   if (!fs.existsSync(dir)) return result;
@@ -29,17 +45,11 @@ function readDirRecursive(dir) {
     fs.readdirSync(dir).forEach(function(file) {
       var fullPath = path.join(dir, file);
       try {
-        var stat = fs.statSync(fullPath);
-        if (stat.isDirectory()) {
+        if (fs.statSync(fullPath).isDirectory()) {
           result[file] = readDirRecursive(fullPath);
-        } else if (stat.size > 0 && stat.size < 5 * 1024 * 1024) {
-          try {
-            var buf = Buffer.alloc(stat.size);
-            var fd = fs.openSync(fullPath, 'r');
-            fs.readSync(fd, buf, 0, stat.size, 0);
-            fs.closeSync(fd);
-            result[file] = buf.toString('base64');
-          } catch(re) { console.log('Skip file:', file, re.message); }
+        } else {
+          var data = safeReadFile(fullPath);
+          if (data) result[file] = data;
         }
       } catch(e) {}
     });
@@ -54,17 +64,15 @@ function writeDirRecursive(files, base) {
     Object.entries(files).forEach(function(entry) {
       var name = entry[0], val = entry[1];
       var fullPath = path.join(base, name);
-      if (val && typeof val === 'object' && !Array.isArray(val)) {
-        writeDirRecursive(val, fullPath);
-      } else if (typeof val === 'string' && val.length > 0) {
-        try {
+      try {
+        if (val && typeof val === 'object' && !Array.isArray(val)) {
+          writeDirRecursive(val, fullPath);
+        } else if (typeof val === 'string' && val.length > 0) {
           fs.writeFileSync(fullPath, Buffer.from(val, 'base64'));
-        } catch(e) {}
-      }
+        }
+      } catch(e) {}
     });
-  } catch(e) {
-    console.log('Write error:', e.message);
-  }
+  } catch(e) {}
 }
 
 async function saveSession() {
@@ -93,6 +101,26 @@ async function restoreSession() {
     return true;
   } catch(e) {
     console.log('Restore error:', e.message);
+    return false;
+  }
+}
+
+// ─── SAFE SEND ────────────────────────────────────────────
+async function safeSend(content) {
+  try {
+    var info = await currentClient.getState();
+    if (info !== 'CONNECTED') {
+      console.log('Not connected, state:', info);
+      return false;
+    }
+    await currentClient.sendMessage(process.env.CHANNEL_ID, content);
+    return true;
+  } catch(e) {
+    console.log('Send error:', e.message);
+    if (e.message && (e.message.includes('detached') || e.message.includes('Target closed') || e.message.includes('Session closed'))) {
+      console.log('Puppeteer crashed, restarting...');
+      setTimeout(function() { process.exit(1); }, 500);
+    }
     return false;
   }
 }
@@ -146,7 +174,6 @@ app.get('/', function(req, res) {
   <div class="dot"></div>
   <div class="status-text">${isConnected ? 'SYSTEM ONLINE' : status === 'qr' ? 'SCAN QR CODE' : 'INITIALIZING...'}</div>
 </div>
-
 ${status === 'qr' && qrData ? `
 <div class="card">
   <div class="card-title">● SCAN TO CONNECT</div>
@@ -177,34 +204,30 @@ ${status === 'qr' && qrData ? `
   <button class="save-btn" onclick="saveSchedule()">💾 SAVE SCHEDULE</button>
 </div>
 `}
-
 <div class="toast" id="toast"></div>
 <script>
 function showToast(msg, color) {
   var t = document.getElementById('toast');
-  t.textContent = msg;
-  t.style.display = 'block';
-  t.style.borderColor = color || '#00ff66';
-  t.style.color = color || '#00ff66';
+  t.textContent = msg; t.style.display = 'block';
+  t.style.borderColor = color || '#00ff66'; t.style.color = color || '#00ff66';
   setTimeout(function(){ t.style.display='none'; }, 3500);
 }
 function sendPost(type) {
-  showToast('⏳ Generating post...', '#ffaa00');
+  showToast('⏳ Generating...', '#ffaa00');
   fetch('/send?type=' + type)
     .then(r => r.json())
-    .then(d => { if(d.ok) showToast('✅ Posted to channel!'); else showToast('❌ ' + d.error, '#ff4444'); })
-    .catch(() => showToast('❌ Network error!', '#ff4444'));
+    .then(d => { if(d.ok) showToast('✅ Posted!'); else showToast('❌ ' + d.error, '#ff4444'); })
+    .catch(() => showToast('❌ Failed!', '#ff4444'));
 }
 function saveSchedule() {
-  var data = {
-    morning: document.getElementById('t_morning').value,
-    afternoon: document.getElementById('t_afternoon').value,
-    evening: document.getElementById('t_evening').value,
-    night: document.getElementById('t_night').value
-  };
-  fetch('/reschedule', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(data) })
-    .then(r => r.json())
-    .then(d => { if(d.ok) showToast('✅ Schedule saved!'); else showToast('❌ Error', '#ff4444'); });
+  fetch('/reschedule', { method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({
+      morning: document.getElementById('t_morning').value,
+      afternoon: document.getElementById('t_afternoon').value,
+      evening: document.getElementById('t_evening').value,
+      night: document.getElementById('t_night').value
+    })
+  }).then(r => r.json()).then(d => { if(d.ok) showToast('✅ Saved!'); else showToast('❌ Error', '#ff4444'); });
 }
 </script>
 </body>
@@ -216,14 +239,9 @@ app.get('/send', async function(req, res) {
     if (status !== 'connected') return res.json({ ok: false, error: 'Bot not connected!' });
     var content = await generatePost(req.query.type || 'morning');
     if (!content) return res.json({ ok: false, error: 'Groq API failed' });
-    await currentClient.sendMessage(process.env.CHANNEL_ID, content);
-    console.log('✅ Post sent: ' + req.query.type);
-    res.json({ ok: true });
+    var ok = await safeSend(content);
+    res.json({ ok: ok, error: ok ? null : 'Send failed' });
   } catch(e) {
-    console.log('Send error:', e.message);
-    if (e.message && e.message.includes('detached')) {
-      setTimeout(function() { process.exit(1); }, 500);
-    }
     res.json({ ok: false, error: e.message });
   }
 });
@@ -246,7 +264,14 @@ async function initClient() {
     authStrategy: new LocalAuth({ dataPath: '/tmp/.wwebjs_auth' }),
     puppeteer: {
       executablePath: '/usr/bin/chromium',
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--disable-features=site-per-process']
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--disable-features=site-per-process',
+        '--no-zygote'
+      ]
     }
   });
 
