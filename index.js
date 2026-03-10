@@ -86,12 +86,10 @@ async function restoreSession() {
 // ─── SEND TO CHANNEL ──────────────────────────────────────
 async function sendToChannel(content) {
   if (!waSocket) throw new Error('Bot not connected');
-  var channelId = process.env.CHANNEL_ID;
-  // Baileys newsletter JID format
-  var jid = channelId.includes('@') ? channelId : channelId + '@newsletter';
- await waSocket.newsletterSendMessage(jid, { text: content });
+  var jid = process.env.CHANNEL_ID;
+  if (!jid.includes('@newsletter')) jid = jid + '@newsletter';
+  await waSocket.sendMessage(jid, { text: content });
 }
-
 // ─── DASHBOARD ────────────────────────────────────────────
 app.get('/', function(req, res) {
   var isConnected = status === 'connected';
