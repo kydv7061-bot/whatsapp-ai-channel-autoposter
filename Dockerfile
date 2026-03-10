@@ -5,9 +5,11 @@ RUN apt-get update && apt-get install -y \
     python3 \
     make \
     g++ \
+    ca-certificates \
     --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
+RUN git config --global http.sslVerify false
 RUN printf '[url "https://github.com/"]\n\tinsteadOf = git+ssh://git@github.com/\n\tinsteadOf = ssh://git@github.com/\n\tinsteadOf = git@github.com:\n' > /root/.gitconfig
 
 WORKDIR /app
