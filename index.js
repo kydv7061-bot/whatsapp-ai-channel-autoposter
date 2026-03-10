@@ -1,106 +1,37 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const mongoose = require('mongoose');
 const { startChannelAutoPoster, generatePost, reschedulePost } = require('./ai-channel-autoposter');
 const express = require('express');
-const qrcode = require('qrcode');
-const pino = require('pino');
-const fs = require('fs');
-const path = require('path');
+const axios = require('axios');
 
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-var qrData = '';
-var status = 'starting';
-var waSocket = null;
+var status = 'connected'; // Telegram always connected!
 var scheduledTimes = { morning: '08:00', afternoon: '13:00', evening: '18:00', night: '22:00' };
 
-const AUTH_DIR = '/tmp/wa_auth';
+const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID;
 
-const SessionSchema = new mongoose.Schema({
-  name: { type: String, required: true, unique: true },
-  data: { type: mongoose.Schema.Types.Mixed, required: true }
-});
-const Session = mongoose.model('Session', SessionSchema);
-
-function readDirToObj(dir) {
-  var result = {};
-  if (!fs.existsSync(dir)) return result;
-  fs.readdirSync(dir).forEach(function(file) {
-    var fullPath = path.join(dir, file);
-    try {
-      if (fs.statSync(fullPath).isDirectory()) {
-        result[file] = readDirToObj(fullPath);
-      } else {
-        result[file] = fs.readFileSync(fullPath, 'utf8');
-      }
-    } catch(e) {}
-  });
-  return result;
-}
-
-function writeObjToDir(obj, dir) {
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  Object.entries(obj).forEach(function(entry) {
-    var name = entry[0], val = entry[1];
-    var fullPath = path.join(dir, name);
-    try {
-      if (val && typeof val === 'object' && !Array.isArray(val) && !name.endsWith('.json')) {
-        writeObjToDir(val, fullPath);
-      } else {
-        fs.writeFileSync(fullPath, typeof val === 'string' ? val : JSON.stringify(val));
-      }
-    } catch(e) {}
-  });
-}
-
-async function saveSession() {
-  try {
-    if (!fs.existsSync(AUTH_DIR)) return;
-    var data = readDirToObj(AUTH_DIR);
-    if (!data || Object.keys(data).length === 0) return;
-    await Session.findOneAndUpdate(
-      { name: 'baileys' },
-      { name: 'baileys', data: data },
-      { upsert: true, new: true }
-    );
-    console.log('✅ Session saved!');
-  } catch(e) {
-    console.log('Save error:', e.message);
-  }
-}
-
-async function restoreSession() {
-  try {
-    var doc = await Session.findOne({ name: 'baileys' });
-    if (!doc) { console.log('No saved session'); return; }
-    writeObjToDir(doc.data, AUTH_DIR);
-    console.log('✅ Session restored!');
-  } catch(e) {
-    console.log('Restore error:', e.message);
-  }
-}
-
-// ─── SEND TO CHANNEL ──────────────────────────────────────
+// ─── SEND TO TELEGRAM CHANNEL ─────────────────────────────
 async function sendToChannel(content) {
-  if (!waSocket) throw new Error('Bot not connected');
-  var jid = process.env.CHANNEL_ID;
-  if (!jid.includes('@newsletter')) jid = jid + '@newsletter';
-  // Use sendMessage - works for newsletter JIDs
-  await waSocket.sendMessage(jid, { text: content });
+  var url = 'https://api.telegram.org/bot' + BOT_TOKEN + '/sendMessage';
+  var res = await axios.post(url, {
+    chat_id: CHANNEL_ID,
+    text: content,
+    parse_mode: 'Markdown'
+  });
+  return res.data;
 }
 
 // ─── DASHBOARD ────────────────────────────────────────────
 app.get('/', function(req, res) {
-  var isConnected = status === 'connected';
   res.send(`<!DOCTYPE html>
 <html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>JARVIS Control Panel</title>
-  ${!isConnected ? '<meta http-equiv="refresh" content="8">' : ''}
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap');
     * { margin:0; padding:0; box-sizing:border-box; }
@@ -110,9 +41,9 @@ app.get('/', function(req, res) {
     .title { font-size:28px; font-weight:900; letter-spacing:6px; background:linear-gradient(90deg,#00d4ff,#0077ff,#00d4ff); -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
     .divider { height:1px; background:linear-gradient(90deg,transparent,#00d4ff,transparent); margin:12px 0; }
     .status-bar { display:flex; align-items:center; justify-content:center; gap:8px; margin-bottom:16px; }
-    .dot { width:8px; height:8px; border-radius:50%; background:${isConnected ? '#00ff66' : '#ffaa00'}; box-shadow:0 0 8px ${isConnected ? '#00ff66' : '#ffaa00'}; animation:pulse 1.5s infinite; }
+    .dot { width:8px; height:8px; border-radius:50%; background:#00ff66; box-shadow:0 0 8px #00ff66; animation:pulse 1.5s infinite; }
     @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
-    .status-text { font-size:11px; letter-spacing:3px; color:${isConnected ? '#00ff66' : '#ffaa00'}; }
+    .status-text { font-size:11px; letter-spacing:3px; color:#00ff66; }
     .card { background:rgba(0,15,30,0.85); border:1px solid rgba(0,180,255,0.18); border-radius:8px; padding:16px; margin-bottom:12px; }
     .card-title { font-size:9px; letter-spacing:4px; color:#0088bb; margin-bottom:12px; }
     .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
@@ -122,11 +53,6 @@ app.get('/', function(req, res) {
     .time-input { background:rgba(0,0,0,0.4); border:1px solid rgba(0,180,255,0.3); color:#00d4ff; padding:6px 10px; border-radius:3px; font-family:'Share Tech Mono',monospace; font-size:13px; width:90px; text-align:center; }
     .save-btn { background:rgba(0,100,40,0.4); border:1px solid rgba(0,255,100,0.3); color:#00ff66; padding:10px; border-radius:4px; font-family:'Share Tech Mono',monospace; font-size:11px; cursor:pointer; width:100%; margin-top:8px; }
     .toast { display:none; position:fixed; bottom:20px; left:50%; transform:translateX(-50%); background:rgba(0,20,10,0.95); border:1px solid #00ff66; color:#00ff66; padding:10px 24px; border-radius:4px; font-size:12px; z-index:999; white-space:nowrap; }
-    .qr-wrap { background:white; padding:14px; border-radius:6px; margin:8px auto; display:block; width:fit-content; }
-    .qr-wrap img { width:240px; height:240px; display:block; }
-    .hint { font-size:11px; color:#aaccdd; text-align:center; line-height:1.8; margin-top:8px; }
-    .spin { width:32px; height:32px; border:2px solid #003344; border-top-color:#00d4ff; border-radius:50%; animation:spin 1s linear infinite; margin:12px auto; }
-    @keyframes spin { to{transform:rotate(360deg);} }
   </style>
 </head>
 <body>
@@ -138,20 +64,8 @@ app.get('/', function(req, res) {
 <div class="divider"></div>
 <div class="status-bar">
   <div class="dot"></div>
-  <div class="status-text">${isConnected ? 'SYSTEM ONLINE' : status === 'qr' ? 'SCAN QR CODE' : 'INITIALIZING...'}</div>
+  <div class="status-text">SYSTEM ONLINE — TELEGRAM READY</div>
 </div>
-${status === 'qr' && qrData ? `
-<div class="card">
-  <div class="card-title">● SCAN TO CONNECT</div>
-  <div class="qr-wrap"><img src="${qrData}"/></div>
-  <div class="hint">WhatsApp → <b>Linked Devices</b><br/>→ <b>Link a Device</b> → Scan karo</div>
-</div>
-` : !isConnected ? `
-<div class="card" style="text-align:center">
-  <div class="spin"></div>
-  <div class="hint">Please wait... ☕</div>
-</div>
-` : `
 <div class="card">
   <div class="card-title">● INSTANT POST</div>
   <div class="grid2">
@@ -169,7 +83,6 @@ ${status === 'qr' && qrData ? `
   <div class="time-row"><span class="time-label">🌙 AI Fact</span><input type="time" class="time-input" id="t_night" value="${scheduledTimes.night}"/></div>
   <button class="save-btn" onclick="saveSchedule()">💾 SAVE SCHEDULE</button>
 </div>
-`}
 <div class="toast" id="toast"></div>
 <script>
 function showToast(msg, color) {
@@ -201,7 +114,6 @@ function saveSchedule() {
 
 app.get('/send', async function(req, res) {
   try {
-    if (status !== 'connected') return res.json({ ok: false, error: 'Bot not connected!' });
     var content = await generatePost(req.query.type || 'morning');
     if (!content) return res.json({ ok: false, error: 'Groq API failed' });
     await sendToChannel(content);
@@ -226,66 +138,11 @@ app.listen(PORT, '0.0.0.0', function() {
   console.log('JARVIS started on port ' + PORT);
 });
 
-async function connectWA() {
-  if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
-  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-  const { version } = await fetchLatestBaileysVersion();
-
-  const sock = makeWASocket({
-    version,
-    auth: state,
-    logger: pino({ level: 'silent' }),
-    printQRInTerminal: false,
-    browser: ['JARVIS', 'Chrome', '1.0']
-  });
-
-  waSocket = sock;
-
-  sock.ev.on('creds.update', async function() {
-    saveCreds();
-    await saveSession();
-  });
-
-  sock.ev.on('connection.update', async function(update) {
-    var connection = update.connection;
-    var lastDisconnect = update.lastDisconnect;
-    var qr = update.qr;
-
-    if (qr) {
-      status = 'qr';
-      qrData = await qrcode.toDataURL(qr, { errorCorrectionLevel: 'H', margin: 2, width: 400 });
-      console.log('QR Ready!');
-    }
-
-    if (connection === 'open') {
-      status = 'connected';
-      qrData = '';
-      console.log('✅ Bot Ready!');
-      await saveSession();
-      startChannelAutoPoster(sendToChannel, scheduledTimes);
-    }
-
-    if (connection === 'close') {
-      var code = lastDisconnect && lastDisconnect.error && lastDisconnect.error.output && lastDisconnect.error.output.statusCode;
-      var shouldReconnect = code !== DisconnectReason.loggedOut;
-      console.log('Disconnected, code:', code, 'reconnect:', shouldReconnect);
-      waSocket = null;
-      status = 'starting';
-      if (shouldReconnect) {
-        setTimeout(connectWA, 3000);
-      } else {
-        try { await Session.deleteOne({ name: 'baileys' }); } catch(e) {}
-        setTimeout(connectWA, 3000);
-      }
-    }
-  });
-}
-
 async function start() {
   await mongoose.connect(process.env.MONGODB_URI);
   console.log('✅ MongoDB connected!');
-  await restoreSession();
-  await connectWA();
+  startChannelAutoPoster(sendToChannel, scheduledTimes);
+  console.log('✅ Bot Ready!');
 }
 
 start().catch(function(e) {
