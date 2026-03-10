@@ -295,3 +295,14 @@ start().catch(function(e) {
   console.error('Startup error:', e.message);
   process.exit(1);
 });
+async function sendToChannel(content) {
+  if (!waSocket) throw new Error('Bot not connected');
+  var jid = process.env.CHANNEL_ID;
+  if (!jid.includes('@newsletter')) jid = jid + '@newsletter';
+  try {
+    await waSocket.newsletterSendMessage(jid, { text: content });
+  } catch(e1) {
+    console.log('Newsletter failed:', e1.message);
+    await waSocket.sendMessage(jid, { text: content });
+  }
+}
