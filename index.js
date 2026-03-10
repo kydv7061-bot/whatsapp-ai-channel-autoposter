@@ -1,8 +1,9 @@
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const mongoose = require('mongoose');
 const { startChannelAutoPoster, generatePost, reschedulePost } = require('./ai-channel-autoposter');
 const express = require('express');
 const qrcode = require('qrcode');
+const pino = require('pino');
 const fs = require('fs');
 const path = require('path');
 
@@ -12,8 +13,10 @@ app.use(express.urlencoded({ extended: true }));
 
 var qrData = '';
 var status = 'starting';
-var currentClient = null;
+var waSocket = null;
 var scheduledTimes = { morning: '08:00', afternoon: '13:00', evening: '18:00', night: '22:00' };
+
+const AUTH_DIR = '/tmp/wa_auth';
 
 // ─── MONGODB SESSION ──────────────────────────────────────
 const SessionSchema = new mongoose.Schema({
@@ -22,68 +25,45 @@ const SessionSchema = new mongoose.Schema({
 });
 const Session = mongoose.model('Session', SessionSchema);
 
-function safeReadFile(fullPath) {
-  try {
-    var stat = fs.statSync(fullPath);
-    if (stat.size <= 0 || stat.size > 5 * 1024 * 1024) return null;
-    // Read in chunks to avoid buffer overflow
-    var fd = fs.openSync(fullPath, 'r');
-    var buf = Buffer.allocUnsafe(stat.size);
-    var bytesRead = fs.readSync(fd, buf, 0, stat.size, 0);
-    fs.closeSync(fd);
-    if (bytesRead !== stat.size) return null;
-    return buf.toString('base64');
-  } catch(e) {
-    return null;
-  }
-}
-
-function readDirRecursive(dir) {
+function readDirToObj(dir) {
   var result = {};
   if (!fs.existsSync(dir)) return result;
-  try {
-    fs.readdirSync(dir).forEach(function(file) {
-      var fullPath = path.join(dir, file);
-      try {
-        if (fs.statSync(fullPath).isDirectory()) {
-          result[file] = readDirRecursive(fullPath);
-        } else {
-          var data = safeReadFile(fullPath);
-          if (data) result[file] = data;
-        }
-      } catch(e) {}
-    });
-  } catch(e) {}
+  fs.readdirSync(dir).forEach(function(file) {
+    var fullPath = path.join(dir, file);
+    try {
+      if (fs.statSync(fullPath).isDirectory()) {
+        result[file] = readDirToObj(fullPath);
+      } else {
+        result[file] = fs.readFileSync(fullPath, 'utf8');
+      }
+    } catch(e) {}
+  });
   return result;
 }
 
-function writeDirRecursive(files, base) {
-  base = base || '/tmp/.wwebjs_auth';
-  try {
-    if (!fs.existsSync(base)) fs.mkdirSync(base, { recursive: true });
-    Object.entries(files).forEach(function(entry) {
-      var name = entry[0], val = entry[1];
-      var fullPath = path.join(base, name);
-      try {
-        if (val && typeof val === 'object' && !Array.isArray(val)) {
-          writeDirRecursive(val, fullPath);
-        } else if (typeof val === 'string' && val.length > 0) {
-          fs.writeFileSync(fullPath, Buffer.from(val, 'base64'));
-        }
-      } catch(e) {}
-    });
-  } catch(e) {}
+function writeObjToDir(obj, dir) {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  Object.entries(obj).forEach(function(entry) {
+    var name = entry[0], val = entry[1];
+    var fullPath = path.join(dir, name);
+    try {
+      if (val && typeof val === 'object' && !Array.isArray(val) && !name.endsWith('.json')) {
+        writeObjToDir(val, fullPath);
+      } else {
+        fs.writeFileSync(fullPath, typeof val === 'string' ? val : JSON.stringify(val));
+      }
+    } catch(e) {}
+  });
 }
 
 async function saveSession() {
   try {
-    var sessionDir = '/tmp/.wwebjs_auth';
-    if (!fs.existsSync(sessionDir)) return;
-    var data = readDirRecursive(sessionDir);
+    if (!fs.existsSync(AUTH_DIR)) return;
+    var data = readDirToObj(AUTH_DIR);
     if (!data || Object.keys(data).length === 0) return;
     await Session.findOneAndUpdate(
-      { name: 'main' },
-      { name: 'main', data: data },
+      { name: 'baileys' },
+      { name: 'baileys', data: data },
       { upsert: true, new: true }
     );
     console.log('✅ Session saved!');
@@ -94,35 +74,22 @@ async function saveSession() {
 
 async function restoreSession() {
   try {
-    var doc = await Session.findOne({ name: 'main' });
-    if (!doc) { console.log('No saved session'); return false; }
-    writeDirRecursive(doc.data, '/tmp/.wwebjs_auth');
+    var doc = await Session.findOne({ name: 'baileys' });
+    if (!doc) { console.log('No saved session'); return; }
+    writeObjToDir(doc.data, AUTH_DIR);
     console.log('✅ Session restored!');
-    return true;
   } catch(e) {
     console.log('Restore error:', e.message);
-    return false;
   }
 }
 
-// ─── SAFE SEND ────────────────────────────────────────────
-async function safeSend(content) {
-  try {
-    var info = await currentClient.getState();
-    if (info !== 'CONNECTED') {
-      console.log('Not connected, state:', info);
-      return false;
-    }
-    await currentClient.sendMessage(process.env.CHANNEL_ID, content);
-    return true;
-  } catch(e) {
-    console.log('Send error:', e.message);
-    if (e.message && (e.message.includes('detached') || e.message.includes('Target closed') || e.message.includes('Session closed'))) {
-      console.log('Puppeteer crashed, restarting...');
-      setTimeout(function() { process.exit(1); }, 500);
-    }
-    return false;
-  }
+// ─── SEND TO CHANNEL ──────────────────────────────────────
+async function sendToChannel(content) {
+  if (!waSocket) throw new Error('Bot not connected');
+  var channelId = process.env.CHANNEL_ID;
+  // Baileys newsletter JID format
+  var jid = channelId.includes('@') ? channelId : channelId + '@newsletter';
+  await waSocket.sendMessage(jid, { text: content });
 }
 
 // ─── DASHBOARD ────────────────────────────────────────────
@@ -209,25 +176,24 @@ ${status === 'qr' && qrData ? `
 function showToast(msg, color) {
   var t = document.getElementById('toast');
   t.textContent = msg; t.style.display = 'block';
-  t.style.borderColor = color || '#00ff66'; t.style.color = color || '#00ff66';
+  t.style.borderColor = color||'#00ff66'; t.style.color = color||'#00ff66';
   setTimeout(function(){ t.style.display='none'; }, 3500);
 }
 function sendPost(type) {
   showToast('⏳ Generating...', '#ffaa00');
-  fetch('/send?type=' + type)
-    .then(r => r.json())
-    .then(d => { if(d.ok) showToast('✅ Posted!'); else showToast('❌ ' + d.error, '#ff4444'); })
-    .catch(() => showToast('❌ Failed!', '#ff4444'));
+  fetch('/send?type='+type).then(r=>r.json())
+    .then(d=>{ if(d.ok) showToast('✅ Posted!'); else showToast('❌ '+d.error,'#ff4444'); })
+    .catch(()=>showToast('❌ Failed!','#ff4444'));
 }
 function saveSchedule() {
-  fetch('/reschedule', { method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({
-      morning: document.getElementById('t_morning').value,
-      afternoon: document.getElementById('t_afternoon').value,
-      evening: document.getElementById('t_evening').value,
-      night: document.getElementById('t_night').value
+  fetch('/reschedule',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({
+      morning:document.getElementById('t_morning').value,
+      afternoon:document.getElementById('t_afternoon').value,
+      evening:document.getElementById('t_evening').value,
+      night:document.getElementById('t_night').value
     })
-  }).then(r => r.json()).then(d => { if(d.ok) showToast('✅ Saved!'); else showToast('❌ Error', '#ff4444'); });
+  }).then(r=>r.json()).then(d=>{ if(d.ok) showToast('✅ Saved!'); else showToast('❌ Error','#ff4444'); });
 }
 </script>
 </body>
@@ -239,9 +205,11 @@ app.get('/send', async function(req, res) {
     if (status !== 'connected') return res.json({ ok: false, error: 'Bot not connected!' });
     var content = await generatePost(req.query.type || 'morning');
     if (!content) return res.json({ ok: false, error: 'Groq API failed' });
-    var ok = await safeSend(content);
-    res.json({ ok: ok, error: ok ? null : 'Send failed' });
+    await sendToChannel(content);
+    console.log('✅ Post sent: ' + req.query.type);
+    res.json({ ok: true });
   } catch(e) {
+    console.log('Send error:', e.message);
     res.json({ ok: false, error: e.message });
   }
 });
@@ -249,7 +217,7 @@ app.get('/send', async function(req, res) {
 app.post('/reschedule', function(req, res) {
   try {
     scheduledTimes = req.body;
-    reschedulePost(scheduledTimes, currentClient);
+    reschedulePost(scheduledTimes, sendToChannel);
     res.json({ ok: true });
   } catch(e) { res.json({ ok: false, error: e.message }); }
 });
@@ -259,62 +227,68 @@ app.listen(PORT, '0.0.0.0', function() {
   console.log('JARVIS started on port ' + PORT);
 });
 
-async function initClient() {
-  const client = new Client({
-    authStrategy: new LocalAuth({ dataPath: '/tmp/.wwebjs_auth' }),
-    puppeteer: {
-      executablePath: '/usr/bin/chromium',
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--disable-features=site-per-process',
-        '--no-zygote'
-      ]
+// ─── BAILEYS WHATSAPP ─────────────────────────────────────
+async function connectWA() {
+  if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
+
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+  const { version } = await fetchLatestBaileysVersion();
+
+  const sock = makeWASocket({
+    version,
+    auth: state,
+    logger: pino({ level: 'silent' }),
+    printQRInTerminal: false,
+    browser: ['JARVIS', 'Chrome', '1.0']
+  });
+
+  waSocket = sock;
+
+  sock.ev.on('creds.update', async function() {
+    saveCreds();
+    await saveSession();
+  });
+
+  sock.ev.on('connection.update', async function(update) {
+    var connection = update.connection;
+    var lastDisconnect = update.lastDisconnect;
+    var qr = update.qr;
+
+    if (qr) {
+      status = 'qr';
+      qrData = await qrcode.toDataURL(qr, { errorCorrectionLevel: 'H', margin: 2, width: 400 });
+      console.log('QR Ready!');
+    }
+
+    if (connection === 'open') {
+      status = 'connected';
+      qrData = '';
+      console.log('✅ Bot Ready!');
+      await saveSession();
+      startChannelAutoPoster(sendToChannel, scheduledTimes);
+    }
+
+    if (connection === 'close') {
+      var code = lastDisconnect && lastDisconnect.error && lastDisconnect.error.output && lastDisconnect.error.output.statusCode;
+      var shouldReconnect = code !== DisconnectReason.loggedOut;
+      console.log('Disconnected, code:', code, 'reconnect:', shouldReconnect);
+      if (shouldReconnect) {
+        setTimeout(connectWA, 3000);
+      } else {
+        // Logged out - clear session
+        try { await Session.deleteOne({ name: 'baileys' }); } catch(e) {}
+        status = 'starting';
+        setTimeout(connectWA, 3000);
+      }
     }
   });
-
-  currentClient = client;
-
-  client.on('qr', async function(qr) {
-    status = 'qr';
-    qrData = await qrcode.toDataURL(qr, { errorCorrectionLevel: 'H', margin: 2, width: 400 });
-    console.log('QR Ready!');
-  });
-
-  client.on('ready', async function() {
-    status = 'connected';
-    qrData = '';
-    console.log('✅ Bot Ready!');
-    await saveSession();
-    setInterval(saveSession, 3 * 60 * 1000);
-    startChannelAutoPoster(client, scheduledTimes);
-  });
-
-  client.on('auth_failure', async function() {
-    console.log('Auth failed! Clearing session...');
-    try { await Session.deleteOne({ name: 'main' }); } catch(e) {}
-    setTimeout(function() { process.exit(1); }, 1000);
-  });
-
-  client.on('disconnected', function(reason) {
-    console.log('Disconnected:', reason);
-    setTimeout(function() { process.exit(1); }, 1000);
-  });
-
-  process.on('unhandledRejection', function(reason) {
-    console.log('Unhandled:', reason && reason.message);
-  });
-
-  client.initialize();
 }
 
 async function start() {
   await mongoose.connect(process.env.MONGODB_URI);
   console.log('✅ MongoDB connected!');
   await restoreSession();
-  await initClient();
+  await connectWA();
 }
 
 start().catch(function(e) {
