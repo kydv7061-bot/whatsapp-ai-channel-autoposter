@@ -32,7 +32,7 @@ function readDirRecursive(dir) {
         var stat = fs.statSync(fullPath);
         if (stat.isDirectory()) {
           result[file] = readDirRecursive(fullPath);
-        } else if (stat.size > 0 && stat.size < 10 * 1024 * 1024) { // skip files > 10MB
+        } else if (stat.size > 0 && stat.size < 8 * 1024 * 1024) { // skip files > 10MB
           result[file] = fs.readFileSync(fullPath, 'base64');
         }
       } catch(e) {}
@@ -240,7 +240,7 @@ async function initClient() {
     authStrategy: new LocalAuth({ dataPath: '/tmp/.wwebjs_auth' }),
     puppeteer: {
       executablePath: '/usr/bin/chromium',
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--single-process']
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--disable-features=site-per-process']
     }
   });
 
