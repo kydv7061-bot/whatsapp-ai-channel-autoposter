@@ -89,7 +89,7 @@ async function sendToChannel(content) {
   var channelId = process.env.CHANNEL_ID;
   // Baileys newsletter JID format
   var jid = channelId.includes('@') ? channelId : channelId + '@newsletter';
-  await waSocket.sendMessage(jid, { text: content });
+ await waSocket.newsletterSendMessage(jid, { text: content });
 }
 
 // ─── DASHBOARD ────────────────────────────────────────────
