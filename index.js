@@ -18,7 +18,7 @@ var scheduledTimes = { morning: '08:00', afternoon: '13:00', evening: '18:00', n
 // ─── MONGODB SESSION ──────────────────────────────────────
 const SessionSchema = new mongoose.Schema({
   name: { type: String, required: true, unique: true },
-  data: { type: String, required: true }
+  data: { type: mongoose.Schema.Types.Mixed, required: true }
 });
 const Session = mongoose.model('Session', SessionSchema);
 
@@ -29,9 +29,10 @@ function readDirRecursive(dir) {
     fs.readdirSync(dir).forEach(function(file) {
       var fullPath = path.join(dir, file);
       try {
-        if (fs.statSync(fullPath).isDirectory()) {
+        var stat = fs.statSync(fullPath);
+        if (stat.isDirectory()) {
           result[file] = readDirRecursive(fullPath);
-        } else {
+        } else if (stat.size > 0 && stat.size < 10 * 1024 * 1024) { // skip files > 10MB
           result[file] = fs.readFileSync(fullPath, 'base64');
         }
       } catch(e) {}
@@ -47,10 +48,12 @@ function writeDirRecursive(files, base) {
     Object.entries(files).forEach(function(entry) {
       var name = entry[0], val = entry[1];
       var fullPath = path.join(base, name);
-      if (typeof val === 'object' && val !== null) {
+      if (val && typeof val === 'object' && !Array.isArray(val)) {
         writeDirRecursive(val, fullPath);
-      } else if (typeof val === 'string') {
-        fs.writeFileSync(fullPath, Buffer.from(val, 'base64'));
+      } else if (typeof val === 'string' && val.length > 0) {
+        try {
+          fs.writeFileSync(fullPath, Buffer.from(val, 'base64'));
+        } catch(e) {}
       }
     });
   } catch(e) {
@@ -61,21 +64,15 @@ function writeDirRecursive(files, base) {
 async function saveSession() {
   try {
     var sessionDir = '/tmp/.wwebjs_auth';
-    if (!fs.existsSync(sessionDir)) {
-      console.log('Session dir not found, skipping save');
-      return;
-    }
-    var data = JSON.stringify(readDirRecursive(sessionDir));
-    if (data === '{}') {
-      console.log('Empty session, skipping save');
-      return;
-    }
+    if (!fs.existsSync(sessionDir)) return;
+    var data = readDirRecursive(sessionDir);
+    if (!data || Object.keys(data).length === 0) return;
     await Session.findOneAndUpdate(
       { name: 'main' },
       { name: 'main', data: data },
       { upsert: true, new: true }
     );
-    console.log('✅ Session saved to MongoDB!');
+    console.log('✅ Session saved!');
   } catch(e) {
     console.log('Save error:', e.message);
   }
@@ -84,9 +81,9 @@ async function saveSession() {
 async function restoreSession() {
   try {
     var doc = await Session.findOne({ name: 'main' });
-    if (!doc) { console.log('No saved session found'); return false; }
-    writeDirRecursive(JSON.parse(doc.data), '/tmp/.wwebjs_auth');
-    console.log('✅ Session restored from MongoDB!');
+    if (!doc) { console.log('No saved session'); return false; }
+    writeDirRecursive(doc.data, '/tmp/.wwebjs_auth');
+    console.log('✅ Session restored!');
     return true;
   } catch(e) {
     console.log('Restore error:', e.message);
@@ -214,9 +211,13 @@ app.get('/send', async function(req, res) {
     var content = await generatePost(req.query.type || 'morning');
     if (!content) return res.json({ ok: false, error: 'Groq API failed' });
     await currentClient.sendMessage(process.env.CHANNEL_ID, content);
+    console.log('✅ Post sent: ' + req.query.type);
     res.json({ ok: true });
   } catch(e) {
     console.log('Send error:', e.message);
+    if (e.message && e.message.includes('detached')) {
+      setTimeout(function() { process.exit(1); }, 500);
+    }
     res.json({ ok: false, error: e.message });
   }
 });
@@ -234,7 +235,6 @@ app.listen(PORT, '0.0.0.0', function() {
   console.log('JARVIS started on port ' + PORT);
 });
 
-// ─── WHATSAPP CLIENT ──────────────────────────────────────
 async function initClient() {
   const client = new Client({
     authStrategy: new LocalAuth({ dataPath: '/tmp/.wwebjs_auth' }),
@@ -257,19 +257,23 @@ async function initClient() {
     qrData = '';
     console.log('✅ Bot Ready!');
     await saveSession();
-    setInterval(saveSession, 3 * 60 * 1000); // Save every 3 mins
+    setInterval(saveSession, 3 * 60 * 1000);
     startChannelAutoPoster(client, scheduledTimes);
   });
 
   client.on('auth_failure', async function() {
     console.log('Auth failed! Clearing session...');
-    await Session.deleteOne({ name: 'main' });
+    try { await Session.deleteOne({ name: 'main' }); } catch(e) {}
     setTimeout(function() { process.exit(1); }, 1000);
   });
 
   client.on('disconnected', function(reason) {
     console.log('Disconnected:', reason);
     setTimeout(function() { process.exit(1); }, 1000);
+  });
+
+  process.on('unhandledRejection', function(reason) {
+    console.log('Unhandled:', reason && reason.message);
   });
 
   client.initialize();
@@ -281,10 +285,6 @@ async function start() {
   await restoreSession();
   await initClient();
 }
-
-process.on('unhandledRejection', function(reason) {
-  console.log('Unhandled error:', reason && reason.message);
-});
 
 start().catch(function(e) {
   console.error('Startup error:', e.message);
