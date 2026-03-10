@@ -2,9 +2,48 @@ const cron = require('node-cron');
 const axios = require('axios');
 
 var cronJobs = {};
+var postHistory = [];
 
-const PROMPTS = {
-  morning: `Write a WhatsApp channel post about latest AI news.
+const HASHTAGS = {
+  morning: '#AINews #TechNews #ArtificialIntelligence #Hinglish #AIDaily',
+  afternoon: '#AITools #TechTools #ProductivityTools #AIDaily',
+  evening: '#AIStory #TechUpdate #DeepDive #AIDaily',
+  night: '#AIFacts #DidYouKnow #TechFacts #AIDaily'
+};
+
+async function fetchRealNews() {
+  try {
+    var apiKey = process.env.NEWS_API_KEY;
+    if (!apiKey) return null;
+    var res = await axios.get('https://newsapi.org/v2/everything', {
+      params: {
+        q: 'artificial intelligence OR AI technology',
+        sortBy: 'publishedAt',
+        language: 'en',
+        pageSize: 5,
+        apiKey: apiKey
+      }
+    });
+    if (!res.data.articles || res.data.articles.length === 0) return null;
+    return res.data.articles.slice(0, 3).map(function(a) {
+      return '• ' + a.title + ' (' + a.source.name + ')';
+    }).join('\n');
+  } catch(e) {
+    console.log('News API error:', e.message);
+    return null;
+  }
+}
+
+async function generatePost(type) {
+  try {
+    var newsContext = '';
+    if (type === 'morning' || type === 'evening') {
+      var news = await fetchRealNews();
+      if (news) newsContext = '\n\nReal news headlines to base your post on:\n' + news;
+    }
+
+    var prompts = {
+      morning: `Write a WhatsApp/Telegram channel post about latest AI news.${newsContext}
 Format exactly like this:
 🌅 *AI MORNING BRIEF*
 ━━━━━━━━━━━━━━━━━━━━
@@ -19,7 +58,7 @@ Format exactly like this:
 ━━━━━━━━━━━━━━━━━━━━
 🤖 _Powered by AI Daily_`,
 
-  afternoon: `Write a WhatsApp post about ONE useful AI tool.
+      afternoon: `Write a Telegram post about ONE useful AI tool today.
 Format exactly like this:
 ☀️ *AI TOOL SPOTLIGHT*
 ━━━━━━━━━━━━━━━━━━━━
@@ -32,10 +71,11 @@ Format exactly like this:
 [2-3 lines in Hinglish]
 
 💰 *Price:* [Free/Paid/Freemium]
+🔗 *Link:* [website]
 ━━━━━━━━━━━━━━━━━━━━
 🤖 _Powered by AI Daily_`,
 
-  evening: `Write a WhatsApp deep-dive on biggest AI story this week.
+      evening: `Write a Telegram deep-dive on biggest AI story.${newsContext}
 Format exactly like this:
 🌆 *AI BIG STORY*
 ━━━━━━━━━━━━━━━━━━━━
@@ -46,36 +86,51 @@ Format exactly like this:
 
 💡 *Iska matlab kya hai?*
 [2-3 lines in Hinglish]
+
+🌏 *India ke liye?*
+[1-2 lines in Hinglish]
 ━━━━━━━━━━━━━━━━━━━━
 🤖 _Powered by AI Daily_`,
 
-  night: `Write a fun WhatsApp post with a mind-blowing AI fact.
+      night: `Write a fun Telegram post with a mind-blowing AI fact.
 Format exactly like this:
 🌙 *AI FACT OF THE DAY*
 ━━━━━━━━━━━━━━━━━━━━
 🤯 *[Title]*
 [3-4 fun lines in Hinglish]
 
-💬 *Tumhara kya opinion hai?*
+💬 *Tumhara kya opinion hai? Comment karo!*
 ━━━━━━━━━━━━━━━━━━━━
-🔁 _Share karo AI lovers ke saath!_`
-};
+🔁 _Share karo AI lovers ke saath!_
+🤖 _Powered by AI Daily_`
+    };
 
-async function generatePost(type) {
-  try {
     var res = await axios.post(
       'https://api.groq.com/openai/v1/chat/completions',
       {
         model: 'llama-3.3-70b-versatile',
-        max_tokens: 600,
+        max_tokens: 700,
         messages: [
-          { role: 'system', content: 'You are an AI news curator for WhatsApp. Write in Hinglish. Use *bold* and _italic_ formatting.' },
-          { role: 'user', content: PROMPTS[type] || PROMPTS.morning }
+          { role: 'system', content: 'You are an AI news curator for Telegram. Write in Hinglish (Hindi+English mix). Use *bold* and _italic_ Telegram formatting. Be engaging and informative.' },
+          { role: 'user', content: prompts[type] || prompts.morning }
         ]
       },
       { headers: { 'Authorization': 'Bearer ' + process.env.GROQ_API_KEY, 'Content-Type': 'application/json' } }
     );
-    return res.data.choices[0].message.content.trim();
+
+    var content = res.data.choices[0].message.content.trim();
+    // Add hashtags
+    content = content + '\n\n' + HASHTAGS[type];
+    
+    // Save to history
+    postHistory.unshift({
+      type: type,
+      time: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
+      preview: content.substring(0, 80) + '...'
+    });
+    if (postHistory.length > 20) postHistory.pop();
+
+    return content;
   } catch(e) {
     console.error('Groq error:', e.message);
     return null;
@@ -118,4 +173,8 @@ function reschedulePost(times, sendFn) {
   scheduleAll(sendFn, times);
 }
 
-module.exports = { startChannelAutoPoster, generatePost, reschedulePost };
+function getHistory() {
+  return postHistory;
+}
+
+module.exports = { startChannelAutoPoster, generatePost, reschedulePost, getHistory };
