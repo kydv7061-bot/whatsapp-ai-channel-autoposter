@@ -16,14 +16,19 @@ const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID;
 // ─── SEND TO TELEGRAM CHANNEL ─────────────────────────────
 async function sendToChannel(content) {
   var url = 'https://api.telegram.org/bot' + BOT_TOKEN + '/sendMessage';
-  var res = await axios.post(url, {
-    chat_id: CHANNEL_ID,
-    text: content,
-    parse_mode: 'Markdown'
-  });
-  return res.data;
+  try {
+    var res = await axios.post(url, {
+      chat_id: CHANNEL_ID,
+      text: content,
+      parse_mode: 'Markdown'
+    });
+    return res.data;
+  } catch(e) {
+    var errMsg = e.response ? JSON.stringify(e.response.data) : e.message;
+    console.log('Telegram error:', errMsg);
+    throw new Error(errMsg);
+  }
 }
-
 // ─── DASHBOARD ────────────────────────────────────────────
 app.get('/', function(req, res) {
   res.send(`<!DOCTYPE html>
