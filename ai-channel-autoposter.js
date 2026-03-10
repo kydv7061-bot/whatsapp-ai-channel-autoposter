@@ -10,7 +10,7 @@ const HASHTAGS = {
   evening: '#AIStory #TechUpdate #DeepDive #AIDaily',
   night: '#AIFacts #DidYouKnow #TechFacts #AIDaily'
 };
-
+ 
 async function fetchRealNews() { 
   try {
     var apiKey = process.env.NEWS_API_KEY;
