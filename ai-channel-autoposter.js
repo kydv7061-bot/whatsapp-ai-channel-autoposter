@@ -1,57 +1,120 @@
-const nodeCron = require('node-cron');
+const cron = require('node-cron');
 const axios = require('axios');
-require('dotenv').config();
+
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const CHANNEL_ID = process.env.CHANNEL_ID;
+
+var cronJobs = {};
+
+const PROMPTS = {
+  morning: `Write a WhatsApp channel post about latest AI news from last 24 hours.
+Format exactly:
+🌅 *AI MORNING BRIEF*
+━━━━━━━━━━━━━━━━━━━━
+📌 *[Headline 1]*
+[2-3 lines in Hinglish]
+📌 *[Headline 2]*
+[2-3 lines in Hinglish]
+📌 *[Headline 3]*
+[2-3 lines in Hinglish]
+━━━━━━━━━━━━━━━━━━━━
+🤖 _Powered by AI Daily_`,
+
+  afternoon: `Write a WhatsApp post about ONE useful AI tool today.
+Format exactly:
+☀️ *AI TOOL SPOTLIGHT*
+━━━━━━━━━━━━━━━━━━━━
+🔧 *Tool: [NAME]*
+❓ *Kya karta hai?*
+[2-3 lines in Hinglish]
+🚀 *Kyu try karo?*
+[2-3 lines in Hinglish]
+💰 *Price:* [Free/Paid/Freemium]
+🔗 *Link:* [website]
+━━━━━━━━━━━━━━━━━━━━
+🤖 _Powered by AI Daily_`,
+
+  evening: `Write a WhatsApp deep-dive on biggest AI story this week.
+Format exactly:
+🌆 *AI BIG STORY*
+━━━━━━━━━━━━━━━━━━━━
+🔥 *[Story Title]*
+📖 *Kya hua?*
+[3-4 lines in Hinglish]
+💡 *Iska matlab kya hai?*
+[2-3 lines in Hinglish]
+🌏 *India ke liye?*
+[1-2 lines in Hinglish]
+━━━━━━━━━━━━━━━━━━━━
+🤖 _Powered by AI Daily_`,
+
+  night: `Write a fun WhatsApp post with a mind-blowing AI fact.
+Format exactly:
+🌙 *AI FACT OF THE DAY*
+━━━━━━━━━━━━━━━━━━━━
+🤯 *[Title]*
+[3-4 fun lines in Hinglish]
+💬 *Tumhara kya opinion hai? Reply karo!*
+━━━━━━━━━━━━━━━━━━━━
+🔁 _Share karo AI lovers ke saath!_
+🤖 _Powered by AI Daily_`
+};
 
 async function generatePost(type) {
-    const prompts = {
-        'morning': 'Generate a brief AI news update in Hinglish for morning. Format with WhatsApp bold and italic. Keep it under 150 words.',
-        'afternoon': 'Generate an AI tool spotlight post in Hinglish for afternoon. Format with WhatsApp bold and italic. Keep it under 150 words.',
-        'evening': 'Generate a big AI story summary in Hinglish for evening. Format with WhatsApp bold and italic. Keep it under 150 words.',
-        'night': 'Generate an interesting AI fact of the day in Hinglish for night. Format with WhatsApp bold and italic. Keep it under 150 words.'
-    };
+  try {
+    var res = await axios.post(
+      'https://api.groq.com/openai/v1/chat/completions',
+      {
+        model: 'llama-3.3-70b-versatile',
+        max_tokens: 600,
+        messages: [
+          { role: 'system', content: 'You are an AI news curator for WhatsApp. Write in Hinglish. Use *bold* and _italic_ formatting.' },
+          { role: 'user', content: PROMPTS[type] || PROMPTS.morning }
+        ]
+      },
+      { headers: { 'Authorization': 'Bearer ' + GROQ_API_KEY, 'Content-Type': 'application/json' } }
+    );
+    return res.data.choices[0].message.content.trim();
+  } catch(e) {
+    console.error('Groq error:', e.message);
+    return null;
+  }
+}
 
-    try {
-        const response = await axios.post('https://api.groq.com/openai/v1/chat/completions', {
-            model: 'llama-3.3-70b-versatile',
-            messages: [{ role: 'user', content: prompts[type] || prompts['morning'] }]
-        }, {
-            headers: {
-                'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
-                'Content-Type': 'application/json'
-            }
-        });
-        return response.data.choices[0].message.content;
-    } catch (error) {
-        console.error('Error generating post:', error);
-        return `*${type.toUpperCase()}* - _AI Post Generation Error_`;
-    }
+function timeToCron(timeStr) {
+  var parts = timeStr.split(':');
+  return parts[1] + ' ' + parts[0] + ' * * *';
+}
+
+function scheduleAll(client, times) {
+  Object.values(cronJobs).forEach(function(job) { if(job) job.stop(); });
+  cronJobs = {};
+  Object.entries(times).forEach(function(entry) {
+    var name = entry[0], time = entry[1];
+    cronJobs[name] = cron.schedule(timeToCron(time), async function() {
+      console.log('Posting ' + name + '...');
+      var content = await generatePost(name);
+      if (content) {
+        try {
+          await client.sendMessage(CHANNEL_ID, content);
+          console.log('✅ Posted: ' + name);
+        } catch(e) {
+          console.log('Post error:', e.message);
+        }
+      }
+    }, { timezone: 'Asia/Kolkata' });
+    console.log(name + ' scheduled at ' + time + ' IST');
+  });
 }
 
 function startChannelAutoPoster(client, times) {
-    const jobs = [];
-    const types = ['morning', 'afternoon', 'evening', 'night'];
-
-    types.forEach((type, index) => {
-        const cronTime = times[index];
-        const job = nodeCron.schedule(cronTime, async () => {
-            try {
-                const post = await generatePost(type);
-                await client.sendMessage(process.env.CHANNEL_ID, post);
-                console.log(`${type.toUpperCase()} post sent successfully`);
-            } catch (error) {
-                console.error(`Error sending ${type} post:`, error);
-            }
-        }, { timezone: 'Asia/Kolkata' });
-        jobs.push(job);
-    });
-    return jobs;
+  times = times || { morning:'08:00', afternoon:'13:00', evening:'18:00', night:'22:00' };
+  console.log('Auto-Poster started!');
+  scheduleAll(client, times);
 }
 
 function reschedulePost(times, client) {
-    const currentJobs = nodeCron.getTasks();
-    currentJobs.forEach(task => task.stop());
-    const newJobs = startChannelAutoPoster(client, times);
-    return newJobs;
+  scheduleAll(client, times);
 }
 
-module.exports = { generatePost, startChannelAutoPoster, reschedulePost };
+module.exports = { startChannelAutoPoster, generatePost, reschedulePost };
