@@ -13,12 +13,11 @@ app.use(express.urlencoded({ extended: true }));
 
 var qrData = '';
 var status = 'starting';
-var waSocket = null; 
+var waSocket = null;
 var scheduledTimes = { morning: '08:00', afternoon: '13:00', evening: '18:00', night: '22:00' };
 
 const AUTH_DIR = '/tmp/wa_auth';
 
-// ─── MONGODB SESSION ──────────────────────────────────────
 const SessionSchema = new mongoose.Schema({
   name: { type: String, required: true, unique: true },
   data: { type: mongoose.Schema.Types.Mixed, required: true }
@@ -88,8 +87,10 @@ async function sendToChannel(content) {
   if (!waSocket) throw new Error('Bot not connected');
   var jid = process.env.CHANNEL_ID;
   if (!jid.includes('@newsletter')) jid = jid + '@newsletter';
+  // Use sendMessage - works for newsletter JIDs
   await waSocket.sendMessage(jid, { text: content });
 }
+
 // ─── DASHBOARD ────────────────────────────────────────────
 app.get('/', function(req, res) {
   var isConnected = status === 'connected';
@@ -225,10 +226,8 @@ app.listen(PORT, '0.0.0.0', function() {
   console.log('JARVIS started on port ' + PORT);
 });
 
-// ─── BAILEYS WHATSAPP ─────────────────────────────────────
 async function connectWA() {
   if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
-
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
 
@@ -270,12 +269,12 @@ async function connectWA() {
       var code = lastDisconnect && lastDisconnect.error && lastDisconnect.error.output && lastDisconnect.error.output.statusCode;
       var shouldReconnect = code !== DisconnectReason.loggedOut;
       console.log('Disconnected, code:', code, 'reconnect:', shouldReconnect);
+      waSocket = null;
+      status = 'starting';
       if (shouldReconnect) {
         setTimeout(connectWA, 3000);
       } else {
-        // Logged out - clear session
         try { await Session.deleteOne({ name: 'baileys' }); } catch(e) {}
-        status = 'starting';
         setTimeout(connectWA, 3000);
       }
     }
@@ -293,14 +292,3 @@ start().catch(function(e) {
   console.error('Startup error:', e.message);
   process.exit(1);
 });
-async function sendToChannel(content) {
-  if (!waSocket) throw new Error('Bot not connected');
-  var jid = process.env.CHANNEL_ID;
-  if (!jid.includes('@newsletter')) jid = jid + '@newsletter';
-  try {
-    await waSocket.newsletterSendMessage(jid, { text: content });
-  } catch(e1) {
-    console.log('Newsletter failed:', e1.message);
-    await waSocket.sendMessage(jid, { text: content });
-  }
-}
